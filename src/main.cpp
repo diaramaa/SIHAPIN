@@ -12,7 +12,15 @@
 #include <WiFiClient.h>
 #include <BlynkSimpleEsp32.h>
 #include <Adafruit_INA219.h>
+#include <PubSubClient.h>
 
+//MQTT
+const char broker[] = "broker.hivemq.com";
+WiFiClient espClient;
+PubSubClient mqtt(espClient); //mqtt
+#define MSG_BUFFER_SIZE  (512)  //
+
+//RTC
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 7*3600;
 const int   daylightOffset_sec = 0;
@@ -30,7 +38,7 @@ unsigned long lastTime;
 BlynkTimer timer;
 
 // pH Sensor
-#define PH_PIN 27
+#define PH_PIN 32
 float volt_PH;
 DFRobot_PH ph;
 
@@ -63,19 +71,11 @@ struct sensors {
   int ldr;
   float phValue;
   float tdsValue;
+  float voltage;
   float energy_Wh;
-  float batteryPercentage;
+  int batteryPercentage;
+  
 } data;
-
-struct random{
-  float temperature;
-  float humidity;
-  int ldr;
-  float phValue;
-  float tdsValue;
-  float energy_Wh;
-  float batteryPercentage;
-} randomData;
 
 void setup_wifi() {
   WiFi.begin(SSID, PASSWORD);
@@ -95,8 +95,23 @@ char* printLocalTime() {
   return formattedTime;
 }
 
+//Blynk Update
+void blynkUpdate() {
+  Blynk.virtualWrite(V0, data.temperature);
+  Blynk.virtualWrite(V1, data.humidity);
+  Blynk.virtualWrite(V2, data.ldr);
+  Blynk.virtualWrite(V3, data.phValue);
+  Blynk.virtualWrite(V4, data.tdsValue);
+  Blynk.virtualWrite(V5, data.energy_Wh);
+  Blynk.virtualWrite(V6, data.batteryPercentage);
+}
+
 void taskSensorRead(void *pvParameters) {
+  // UBaseType_t uxHighWaterMark;
   for(;;) {
+    // uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+    // Serial.print("High water mark: ");
+    // Serial.println(uxHighWaterMark);
     // Read DHT sensor
     data.temperature = dht.readTemperature();
     data.humidity = dht.readHumidity();
@@ -116,11 +131,11 @@ void taskSensorRead(void *pvParameters) {
     Serial.println("LDR Intensity: " + String(data.ldr) + "%");
     
     //Read pH Sensor
-    volt_PH = analogRead(PH_PIN)/4096.0 * 5000;
+    volt_PH = analogRead(PH_PIN)/4095.0 * 3300;
     data.phValue = ph.readPH(volt_PH, data.temperature);
     Serial.println("pH Sensor Data:");
     Serial.println("pH: " + String(data.phValue));
-    
+
     //Read TDS sensor
     gravityTds.setTemperature(data.temperature);
     gravityTds.update();
@@ -128,64 +143,94 @@ void taskSensorRead(void *pvParameters) {
     Serial.println("TDS Sensor Data:");
     Serial.println("TDS: " + String(data.tdsValue) + "ppm");
 
-    // Read Current Sensor
-    currentTime = millis();
-    elapsedTime = currentTime - lastTime;
-    if(elapsedTime > 1000){
-      lastTime = currentTime;
-      float shuntvoltage = ina219.getShuntVoltage_mV();
-      float busvoltage = ina219.getBusVoltage_V();
-      float current_mA = ina219.getCurrent_mA();
-      float loadvoltage = busvoltage + (shuntvoltage / 1000);
-      power_W = loadvoltage * current_mA;
-      data.energy_Wh += power_W * (elapsedTime / 3600000.0);
+    //Read Current Sensor
+    float shuntvoltage = ina219.getShuntVoltage_mV(); // Membaca tegangan shunt (dalam mV) dari sensor INA219
+    float busvoltage = ina219.getBusVoltage_V();      // Membaca tegangan bus (dalam V) dari sensor INA219
+    float current_mA = ina219.getCurrent_mA();        // Membaca arus (dalam mA) dari sensor INA219
+    float power_mW = ina219.getPower_mW();            // Membaca daya (dalam mW) dari sensor INA219
+    
+    float loadvoltage = busvoltage + (shuntvoltage / 1000);   //Tegangan beban
 
-      // Calculate battery percentage
-      vmax = 5.0;                                       // Tegangan maksimum pada saat baterai full
-      vmin = 2.5;                                       // Tegangan minimum pada saat baterai kritis
-      data.batteryPercentage = ((loadvoltage - vmin) / (vmax - vmin)) * 100.0;
-      if (data.batteryPercentage > 100) {
-        data.batteryPercentage = 100;
-      } else if (data.batteryPercentage < 0) {
-        data.batteryPercentage = 0;
-      }
-      // Serial.print("Bus Voltage:   "); Serial.print(busvoltage); Serial.println(" V");
-      // Serial.print("Shunt Voltage: "); Serial.print(shuntvoltage); Serial.println(" mV");
-      // Serial.print("Load Voltage:  "); Serial.print(loadvoltage); Serial.println(" V");
-      // Serial.print("Current:       "); Serial.print(current_mA); Serial.println(" mA");
-      // Serial.print("Power:         "); Serial.print(power_W); Serial.println(" W");
-      Serial.print("Total Energy:  "); Serial.print(data.energy_Wh); Serial.println(" Wh");
-      Serial.print("Battery Percentage: "); Serial.print(data.batteryPercentage); Serial.println(" %");
-    }
+    // Calculate battery percentage
+    vmax = 8.0;                                       // Tegangan maksimum pada saat baterai full
+    vmin = 5;                                       // Tegangan minimum pada saat baterai kritis
+    int batteryPercentage = ((loadvoltage - vmin) / (vmax - vmin)) * 100.0;
+
+    currentTime = millis();                           // Waktu saat ini dalam milidetik
+    elapsedTime = currentTime - lastTime;             // Selisih waktu sejak pengukuran terakhir
+    lastTime = currentTime;                           // Perbarui lastTime untuk pengukuran berikutnya
+
+    // Konversi power dari mW ke W dan waktu dari ms ke jam
+    float power_W = power_mW / 1000.0;
+    float elapsedTime_h = elapsedTime / 3600000.0; // 1 jam = 3600000 ms
+
+    // Tambahkan energi ke total
+    totalEnergy_Wh += power_W * elapsedTime_h;
+
+    Serial.println("Current Sensor Data:");
+    Serial.println("Load Voltage: " + String(loadvoltage) + "V");
+    Serial.println("Energy: " + String(totalEnergy_Wh) + "Wh");
+    Serial.println("Battery Percentage: " + String(batteryPercentage) + "%");
+
+    data.voltage = loadvoltage;
+    data.energy_Wh = totalEnergy_Wh;
+    data.batteryPercentage = batteryPercentage;
+
+    // blynkUpdate();
 
     vTaskDelay(pdMS_TO_TICKS(1000)); 
   }
 }
 
-void randomDataGenerator(void *pvParameters) {
-  for(;;) {
-    randomData.temperature = random(20, 30);
-    randomData.humidity = random(50, 70);
-    randomData.ldr = random(0, 100);
-    randomData.phValue = random(0, 14);
-    randomData.tdsValue = random(0, 1000);
-    randomData.energy_Wh = random(0, 100);
-    randomData.batteryPercentage = random(0, 100);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
   }
-  
+  Serial.println();
+
 }
 
-//Blynk Update
-void blynkUpdate() {
-  Blynk.virtualWrite(V0, randomData.temperature);
-  Blynk.virtualWrite(V1, randomData.humidity);
-  Blynk.virtualWrite(V2, randomData.ldr);
-  Blynk.virtualWrite(V3, randomData.phValue);
-  Blynk.virtualWrite(V4, randomData.tdsValue);
-  Blynk.virtualWrite(V5, randomData.energy_Wh);
-  Blynk.virtualWrite(V6, randomData.batteryPercentage);
+void reconnect() {
+  // Loop until we're reconnected
+  while (!mqtt.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (mqtt.connect(clientId.c_str())) {
+      Serial.println("Connected");
+      // Once connected, publish an announcement...
+      mqtt.publish("sihapin/mqtt", "sihapin");
+      // ... and resubscribe
+      mqtt.subscribe("sihapin/mqtt");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
 }
+
+void MQTT_Send(void *pvParameters) {
+  for(;;){
+    if (!mqtt.connected()) {
+      reconnect();
+    }
+    mqtt.loop();
+
+    char msg[MSG_BUFFER_SIZE];
+    snprintf(msg, MSG_BUFFER_SIZE, "%.2f#%.2f#%.2f#%.2f#%.2f#%.2f#%d", data.temperature, data.humidity, data.phValue, data.tdsValue, data.voltage, data.energy_Wh, data.batteryPercentage);
+    mqtt.publish("sihapin/message", msg);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
 
 
 
@@ -238,7 +283,7 @@ void taskLCDUpdate(void *pvParameters) {
     lcd.setCursor(0, 0);
     lcd.print("TDS Sensor Data: ");
     lcd.setCursor(0, 1);
-    lcd.print("Value: " + String(data.phValue, 0) + "ppm");
+    lcd.print("Value: " + String(data.tdsValue) + " ppm");
     vTaskDelay(pdMS_TO_TICKS(3000)); 
 
 
@@ -252,7 +297,7 @@ void pakanIkan_task(void *pvParameters) {
       int currentHour = timeinfo.tm_hour;
       int currentMinute = timeinfo.tm_min;
       int currentSecond = timeinfo.tm_sec;
-      if (currentSecond >= 3 && currentSecond <= 5) {
+      if (currentSecond >= 3 && currentSecond <= 7) {
         Serial.println("[DEBUG] Servo ON (PAKAN IKAN)");
         servo.write(0);   
         delay(500);
@@ -268,8 +313,8 @@ void pakanIkan_task(void *pvParameters) {
     }else{
       Serial.println("Failed to obtain time");
     }
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-  vTaskDelay(pdMS_TO_TICKS(500));
 }
 
 void setup() {
@@ -280,6 +325,8 @@ void setup() {
   gravityTds.setAref(3.3);
   gravityTds.setAdcRange(4096);
   gravityTds.begin();
+
+  ina219.begin();
 
   ph.begin();
   
@@ -313,6 +360,9 @@ void setup() {
   lcd.print("[WiFi] Connected!");
   lcd.setCursor(0, 1);
   lcd.print("IP: " + WiFi.localIP().toString());
+
+  mqtt.setServer(broker, 1883);
+  mqtt.setCallback(callback);
   
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   printLocalTime();
@@ -332,27 +382,27 @@ void setup() {
   xTaskCreate(
     taskSensorRead,   // Function to implement the task
     "Sensor Read",    // Name of the task
-    4096,            // Stack size in words
+    8192,            // Stack size in words
     NULL,             // Task input parameter
     1,                // Priority of the task
     NULL              // Task handle
   );
 
-  // xTaskCreate(
-  //   randomDataGenerator, 
-  //   "Random Data Generator",
-  //   2048,
-  //   NULL,
-  //   1,
-  //   NULL
-  // );
+  xTaskCreate(
+    MQTT_Send,
+    "MQTT Send",
+    4096,
+    NULL,
+    1,
+    NULL
+  );
 
   xTaskCreate(
     pakanIkan_task, // Function to implement the task
     "Pakan Ikan",  // Name of the task
     2048,            // Stack size in words
     NULL,             // Task input parameter
-    1,                // Priority of the task
+    2,                // Priority of the task
     NULL              // Task handle
   );
 
